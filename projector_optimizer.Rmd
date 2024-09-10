@@ -1,0 +1,1157 @@
+---
+title: "Lineup Projector + Optimizer"
+author: "Dylan Kinion"
+date: "2024-07-06"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+runtime: shiny
+---
+Possible ways to improve:
+* features
+  * add height/measurables to oreb_pct
+  * ftr and to rate are over reliant on own stats (i.e ftr relies to heavily on individual ftr)
+* aggregation method for models
+
+
+Notes on model:
+
+packages 
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+library(tidyverse)
+library(dplyr)
+library(lpSolve)
+library(jsonlite)
+library(lubridate)
+library(rsample)
+library(parsnip)
+library(caret)
+library(class)
+library(Metrics)
+library(shiny)
+library(rsconnect)
+library(rvest)
+library(stats)
+library(plotly)
+library(reshape2)
+library(DT)
+library(scales)
+
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 2)
+options(rsconnect.max.bundle.size = 5000*1024^2)
+```
+
+player stats
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+get_season_data <- function(season) {
+  base_url <- "https://www.basketball-reference.com/leagues/NBA_"
+  
+  # URLs for the per-minute and advanced stats pages
+  url_per_minute <- paste0(base_url, season, "_per_minute.html")
+  url_advanced <- paste0(base_url, season, "_advanced.html")
+  
+  # Scrape per-minute stats
+  stats <- read_html(url_per_minute) %>%
+    html_node("table") %>%
+    html_table(fill = TRUE) %>%
+    filter(Player != "Player") %>%
+    select(-Rk)
+  
+  # Scrape advanced stats
+  adv_stats <- read_html(url_advanced) %>%
+    html_node("table") %>%
+    html_table(fill = TRUE) %>%
+    select(2:19, 21:24, 26:29) %>%
+    filter(Player != "Player")
+  
+  # Combine the stats based on Player, Position, and Team
+  combined_stats <- right_join(stats, adv_stats, by = c("Player", "Pos", "Tm"))
+  
+  # Add a column identifying the season
+  combined_stats <- combined_stats %>%
+    mutate(Season = season)
+  
+  return(combined_stats)
+}
+
+# Loop through the seasons and get data
+get_multiple_seasons_data <- function(start_year, end_year) {
+  season_data <- list()
+  
+  for (season in start_year:end_year) {
+    print(paste("Getting data for season:", season))
+    season_data[[as.character(season)]] <- get_season_data(season)
+  }
+  
+  return(season_data)
+}
+
+# Get data for seasons from 2015 to 2024
+all_seasons_data <- get_multiple_seasons_data(2015, 2024)
+combined_df <- bind_rows(all_seasons_data)
+library(stringi)
+combined_df$Player <- stri_trans_general(combined_df$Player, "Latin-ASCII")
+
+combined_df$`3P%` <- as.numeric(combined_df$`3P%`)
+combined_df$`FT%` <- as.numeric(combined_df$`FT%`)
+combined_df$`TS%` <- as.numeric(combined_df$`TS%`)
+combined_df$`3PAr` <- as.numeric(combined_df$`3PAr`)
+combined_df$`FTr` <- as.numeric(combined_df$`FTr`)
+combined_df$`TRB%` <- as.numeric(combined_df$`TRB%`)
+combined_df$`BLK%` <- as.numeric(combined_df$`BLK%`)
+combined_df$`AST%` <- as.numeric(combined_df$`AST%`)
+combined_df$`TOV%` <- as.numeric(combined_df$`TOV%`)
+combined_df$`ORB%` <- as.numeric(combined_df$`ORB%`)
+combined_df$`DRB%` <- as.numeric(combined_df$`DRB%`)
+combined_df$`USG%` <- as.numeric(combined_df$`USG%`)
+combined_df$`FGA` <- as.numeric(combined_df$`FGA`)
+combined_df$`PTS` <- as.numeric(combined_df$`PTS`)
+combined_df$`MP.x` <- as.numeric(combined_df$`MP.x`)
+combined_df$`AST` <- as.numeric(combined_df$`AST`)
+combined_df$`TOV` <- as.numeric(combined_df$`TOV`)
+
+player_pos <- combined_df %>%
+  mutate(groupPosition = case_when(
+    Pos == "PF" ~ 2,
+    Pos == "SG" ~ 2,
+    Pos == "C" ~ 3,
+    Pos == "SF" ~ 2,
+    Pos == "PG" ~ 1,
+    Pos == "SG-PG" ~ 1,
+    Pos == "PG-SG" ~ 1,
+    Pos == "SF-PF" ~ 2,
+    Pos == "SF-SG" ~ 2,
+    Pos == "SG-SF" ~ 2,
+    Pos == "PF-SF" ~ 2,
+    Pos == "PF-C" ~ 1,
+    Pos == "SG-PF" ~ 2,
+    Pos == "C-PF" ~ 1,
+    Pos == "SF-C" ~ 2,
+    Pos == "SG-PG-SF" ~ 1,
+    TRUE ~ 2
+  )) %>%
+  select(Player, Tm, Season, groupPosition)
+
+player_df <- combined_df %>%
+  filter(MP.x > 50) %>%
+  mutate(`TRB%` = `TRB%` * .01,
+         `AST%` = `AST%` * .01,
+         `BLK%` = `BLK%` * .01,
+         `USG%` = `USG%` * .01,
+         `TOV%` = `TOV%` * .01,
+         `ORB%` = `ORB%` * .01) %>%
+  mutate(pps = PTS/FGA,
+         ast_to = AST/TOV) %>%
+  group_by(Player, Season) %>%
+  mutate(avg_pct_fg3 = (`3P%` + ifelse(is.na(lag(`3P%`)), 0.32, lag(`3P%`))) / 2,
+         avg_3pt_rate = (`3PAr` + ifelse(is.na(lag(`3PAr`)), 0.36, lag(`3PAr`))) / 2,
+         avg_TS = (`TS%` + ifelse(is.na(lag(`TS%`)), 0.53, lag(`TS%`))) / 2,
+         avg_ft_pct = (`FT%` + ifelse(is.na(lag(`FT%`)), 0.74, lag(`FT%`))) / 2,
+         avg_ft_rate = (`FTr` + ifelse(is.na(lag(`FTr`)), 0.26, lag(`FTr`))) / 2,
+         avg_treb = (`TRB%` + ifelse(is.na(lag(`TRB%`)), 0.09, lag(`TRB%`))) / 2,
+         avg_ast_pct = (`AST%` + ifelse(is.na(lag(`AST%`)), 0.13, lag(`AST%`))) / 2,
+         avg_blk_pct = (`BLK%` + ifelse(is.na(lag(`BLK%`)), 0.02, lag(`BLK%`))) / 2,
+         avg_usage = (`USG%` + ifelse(is.na(lag(`USG%`)), 0.19, lag(`USG%`))) / 2,
+         avg_tov_pct = (`TOV%` + ifelse(is.na(lag(`TOV%`)), 0.012, lag(`TOV%`))) / 2,
+         avg_oreb_pct = (`ORB%` + ifelse(is.na(lag(`ORB%`)), 0.05, lag(`ORB%`))) / 2,
+         avg_dreb_pct = (`DRB%` + ifelse(is.na(lag(`DRB%`)), 0.149, lag(`DRB%`))) / 2,
+         avg_pps = (pps + ifelse(is.na(lag(pps)), 1.208, lag(pps))) / 2,
+         avg_ast_to = (ast_to + ifelse(is.na(lag(ast_to)), 1.778, lag(ast_to))) / 2
+           ) %>%
+  ungroup() %>%
+  na.omit()
+
+t <- player_df %>%
+  filter(!is.na(ast_to),
+         ast_to != "Inf",
+         MP.x > 100) 
+mean(t$ast_to)
+
+player_df$avg_pps <- rescale(player_df$avg_pps)
+player_df$avg_ast_to <- rescale(player_df$avg_ast_to)
+
+select_stats <- right_join(player_df, player_pos, by = c("Player", "Season")) %>%
+  rename(namePlayer = Player,
+         slugTeamBREF = Tm.x) %>%
+  mutate(pred_season = Season + 1) %>%
+  select(namePlayer,
+         slugTeamBREF,
+         avg_pct_fg3,
+         avg_3pt_rate,
+         avg_TS,
+         avg_ft_pct,
+         avg_ft_rate,
+         avg_treb,
+         avg_ast_pct,
+         avg_blk_pct,
+         avg_tov_pct,
+         avg_usage,
+         avg_oreb_pct,
+         avg_dreb_pct,
+         avg_pps,
+         avg_ast_to,
+         groupPosition,
+         pred_season)
+stats <- right_join(player_df, player_pos, by = c("Player", "Season")) %>%
+  rename(namePlayer = Player,
+         teamAbbreviation = Tm.x,
+         yearSeason = Season) %>%
+  select(namePlayer,
+         teamAbbreviation,
+         avg_pct_fg3,
+         avg_3pt_rate,
+         avg_TS,
+         avg_ft_pct,
+         avg_ft_rate,
+         avg_treb,
+         avg_ast_pct,
+         avg_blk_pct,
+         groupPosition,
+         yearSeason,
+         avg_usage,
+         avg_pps,
+         avg_ast_to)
+
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+
+```
+
+lineup stats
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+seasons <- c("2023-24", "2022-23", "2021-22", "2020-21", "2019-20", "2018-19", "2017-18", "2016-17", "2015-16", "2014-15")
+
+# Initialize an empty list to store data frames
+all_seasons_data <- list()
+
+# Loop through each season and fetch the data
+for (season in seasons) {
+  url <- paste0("https://api.pbpstats.com/get-totals/nba?Season=", season, "&SeasonType=Regular%2BSeason&Type=Lineup")
+  data <- fromJSON(url)
+  lineup_data <- data[["multi_row_table_data"]]
+  
+  # Convert to data frame, add season column
+  lineup_data <- as.data.frame(lineup_data)
+  lineup_data$season <- season  # Add season year
+  
+  # Store the data frame in the list
+  all_seasons_data[[season]] <- lineup_data
+}
+
+# Combine all seasons data into one data frame
+combined_data <- bind_rows(all_seasons_data)
+combined_data <- combined_data %>%
+  filter(!is.na(PlusMinus))
+
+opp_seasons_data <- list()
+
+# Loop through each season and fetch the data
+for (season in seasons) {
+  url_opp <- paste0("https://api.pbpstats.com/get-totals/nba?Season=", season, "&SeasonType=Regular%2BSeason&Type=LineupOpponent")
+  data_opp <- fromJSON(url_opp)
+  lineup_data_opp <- data_opp[["multi_row_table_data"]]
+  
+  # Convert to data frame, add season column
+  lineup_data_opp <- as.data.frame(lineup_data_opp)
+  lineup_data_opp$season <- season  # Add season year
+  
+  # Store the data frame in the list
+  opp_seasons_data[[season]] <- lineup_data_opp
+}
+
+# Combine all seasons data into one data frame
+combined_data_opp <- bind_rows(opp_seasons_data)
+combined_data_opp <- combined_data_opp %>%
+  filter(!is.na(PlusMinus)) %>%
+  rename(opp_def_rebs = DefRebounds) %>%
+  select(EntityId,
+         opp_def_rebs)
+combined_data2 <- right_join(combined_data, combined_data_opp, by = "EntityId")
+
+lineup_data <- combined_data2 %>%
+  filter(OffPoss > 150) %>%
+  separate(Name, into = c("Player 1", "Player 2", "Player 3", "Player 4", "Player 5"), sep = ", ") %>%
+  mutate( fga = FG2A + FG3A,
+    to_pct = Turnovers/(fga + (.44 * FTA) + Turnovers),
+    off_reb_pct = OffRebounds/ (OffRebounds + opp_def_rebs),
+    ftr = FTA/fga) %>%
+  select(TeamAbbreviation,
+         season,
+         EfgPct,
+         to_pct,
+         off_reb_pct,
+         ftr,
+         `Player 1`,
+         `Player 2`,
+         `Player 3`,
+         `Player 4`,
+         `Player 5`) %>%
+  mutate(pred_season = case_when(
+    season == "2023-24" ~ "2024",
+    season == "2022-23" ~ "2023",
+    season == "2021-22" ~ "2022",
+    season == "2020-21" ~ "2021",
+    season == "2019-20" ~ "2020",
+    season == "2018-19" ~ "2019",
+    season == "2017-18" ~ "2018",
+    season == "2016-17" ~ "2017",
+    season == "2015-16" ~ "2016",
+    TRUE ~ "2015"
+  )) %>%
+  select(-c(season))
+lineup_data$pred_season <- as.numeric(lineup_data$pred_season)
+```
+
+combining data frames
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+df_if <- lineup_data %>% 
+  pivot_longer(
+    cols = starts_with("Player"),   # Select the player columns
+    names_to = "Player",            # Create a new column for the player identifier
+    values_to = "namePlayer"        # Create a new column for player names
+  ) %>%
+  mutate(yearSeason = pred_season - 1)
+
+df_stats <- right_join(df_if, select_stats, by = c("namePlayer", "pred_season")) %>%
+  na.omit() %>%
+  distinct() 
+
+df_efg <- df_stats %>%
+  group_by(TeamAbbreviation, EfgPct, pred_season) %>%
+  summarize(
+    avg_3pt_rate = mean(avg_3pt_rate),
+    min_3pt_rate = min(avg_3pt_rate),
+    max_3pt_rate = max(avg_3pt_rate),
+    avg_pct_fg3 = mean(avg_pct_fg3),
+    min_pct_fg3 = min(avg_pct_fg3),
+    max_pct_fg3 = max(avg_pct_fg3),
+    avg_ft_pct = mean(avg_ft_pct),
+    min_ft_pct = min(avg_ft_pct),
+    max_ft_pct = max(avg_ft_pct),
+    avg_TS = mean(avg_TS),
+    min_TS = min(avg_TS),
+    max_TS = max(avg_TS),
+    avg_pps = mean(avg_pps),
+    min_pps = min(avg_pps),
+    max_pps = max(avg_pps)
+  ) %>%
+  ungroup()
+
+df_to_rate <- df_stats %>%
+  filter(avg_ast_to != "Inf") %>%
+  group_by(TeamAbbreviation, to_pct, pred_season) %>%
+  summarize(
+    avg_ast_pct = mean(avg_ast_pct),
+    min_ast_pct = min(avg_ast_pct),
+    max_ast_pct = max(avg_ast_pct),
+    avg_tov_pct = mean(avg_tov_pct),
+    min_tov_pct = min(avg_tov_pct),
+    max_tov_pct = max(avg_tov_pct),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage),
+    avg_ast_to = mean(avg_ast_to),
+    min_ast_to = min(avg_ast_to),
+    max_ast_to = max(avg_ast_to)
+  ) %>%
+  ungroup()
+  
+df_oreb <- df_stats %>%
+  group_by(TeamAbbreviation, off_reb_pct, pred_season) %>%
+  summarize(
+    avg_dreb_pct = mean(avg_dreb_pct),
+    min_dreb_pct = min(avg_dreb_pct),
+    max_dreb_pct = max(avg_dreb_pct),
+    avg_oreb_pct = mean(avg_oreb_pct),
+    min_oreb_pct = min(avg_oreb_pct),
+    max_oreb_pct = max(avg_oreb_pct)
+  ) %>%
+  ungroup()
+
+df_ftr <- df_stats %>%
+  group_by(TeamAbbreviation, ftr, pred_season) %>%
+  summarize(
+    avg_ftr = mean(avg_ft_pct),
+    min_ftr = min(avg_ft_rate),
+    max_ftr = max(avg_ft_rate),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage),
+    avg_ft_pct = mean(avg_ft_pct),
+    min_ft_pct = min(avg_ft_pct),
+    max_ft_pct = max(avg_ft_pct)
+  ) %>%
+  ungroup()
+```
+
+data splitting
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+set.seed(3445)
+
+efg_split <- initial_split(df_efg, prop = .90, strata = EfgPct)
+
+efg_train <- efg_split %>%
+  training() 
+efg_train_c <- efg_train %>%
+  select(-c(1,3))
+
+efg_test <- efg_split %>%
+  testing() 
+efg_test_c <- efg_test %>%
+  select(-c(1,3))
+
+sd(efg_train$EfgPct)
+
+ftr_split <- initial_split(df_ftr, prop = .90, strata = ftr)
+
+ftr_train <- ftr_split %>%
+  training() 
+ftr_train_c <- ftr_train %>%
+  select(-c(1,3))
+
+ftr_test <- ftr_split %>%
+  testing() 
+ftr_test_c <- ftr_test %>%
+  select(-c(1,3))
+
+sd(ftr_train$ftr)
+
+oreb_split <- initial_split(df_oreb, prop = .90, strata = off_reb_pct)
+
+oreb_train <- oreb_split %>%
+  training() 
+oreb_train_c <- oreb_train %>%
+  select(-c(1,3))
+
+oreb_test <- oreb_split %>%
+  testing() 
+oreb_test_c <- oreb_test %>%
+  select(-c(1,3))
+
+sd(oreb_train$off_reb_pct)
+
+tor_split <- initial_split(df_to_rate, prop = .90, strata = to_pct)
+
+tor_train <- tor_split %>%
+  training() 
+tor_train_c <- tor_train %>%
+  select(-c(1,3))
+
+tor_test <- tor_split %>%
+  testing() 
+tor_test_c <- tor_test %>%
+  select(-c(1,3))
+
+sd(tor_train$to_pct)
+```
+
+SVM
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+svm_model <- svm_linear() %>%
+  set_engine("kernlab") %>%
+  set_mode("regression")
+
+svm_fit_efg <- svm_model %>%
+  fit(EfgPct ~ ., data = efg_train_c)
+svm_preds_efg <- predict(svm_fit_efg, new_data = efg_test_c) %>%
+  as.data.frame() %>%
+  cbind(efg_test$EfgPct)
+MAE(svm_preds_efg$.pred, efg_test$EfgPct, na.rm = FALSE)
+
+svm_fit_ftr <- svm_model %>%
+  fit(ftr ~ ., data = ftr_train_c)
+svm_preds_ftr <- predict(svm_fit_ftr, new_data = ftr_test_c) %>%
+  as.data.frame() %>%
+  cbind(ftr_test$ftr)
+MAE(svm_preds_ftr$.pred, ftr_test$ftr, na.rm = FALSE)
+
+svm_fit_oreb <- svm_model %>%
+  fit(off_reb_pct ~ ., data = oreb_train_c)
+svm_preds_oreb <- predict(svm_fit_oreb, new_data = oreb_test_c) %>%
+  as.data.frame() %>%
+  cbind(oreb_test$off_reb_pct)
+MAE(svm_preds_oreb$.pred, oreb_test$off_reb_pct, na.rm = FALSE)
+
+svm_fit_tor <- svm_model %>%
+  fit(to_pct ~ ., data = tor_train_c)
+svm_preds_tor <- predict(svm_fit_tor, new_data = tor_test_c) %>%
+  as.data.frame() %>%
+  cbind(tor_test$to_pct)
+MAE(svm_preds_tor$.pred, tor_test$to_pct, na.rm = FALSE)
+```
+
+rand forest
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+rf_model <- rand_forest() %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+rf_fit_efg <- rf_model %>%
+  fit(EfgPct ~ ., data = efg_train_c)
+rf_preds_efg <- predict(rf_fit_efg, new_data = efg_test_c) %>%
+  as.data.frame() %>%
+  cbind(efg_test$EfgPct)
+MAE(rf_preds_efg$.pred, efg_test$EfgPct, na.rm = FALSE)
+
+rf_fit_ftr <- rf_model %>%
+  fit(ftr ~ ., data = ftr_train_c)
+rf_preds_ftr <- predict(rf_fit_ftr, new_data = ftr_test_c) %>%
+  as.data.frame() %>%
+  cbind(ftr_test$ftr)
+MAE(rf_preds_ftr$.pred, ftr_test$ftr, na.rm = FALSE)
+
+rf_fit_oreb <- rf_model %>%
+  fit(off_reb_pct ~ ., data = oreb_train_c)
+rf_preds_oreb <- predict(rf_fit_oreb, new_data = oreb_test_c) %>%
+  as.data.frame() %>%
+  cbind(oreb_test$off_reb_pct)
+MAE(rf_preds_oreb$.pred, oreb_test$off_reb_pct, na.rm = FALSE)
+
+rf_fit_tor <- rf_model %>%
+  fit(to_pct ~ ., data = tor_train_c)
+rf_preds_tor <- predict(rf_fit_tor, new_data = tor_test_c) %>%
+  as.data.frame() %>%
+  cbind(tor_test$to_pct)
+MAE(rf_preds_tor$.pred, tor_test$to_pct, na.rm = FALSE)
+```
+
+gbm
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+gbm_model <- boost_tree() %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+gbm_fit_efg <- gbm_model %>%
+  fit(EfgPct ~ ., data = efg_train_c)
+gbm_preds_efg <- predict(gbm_fit_efg, new_data = efg_test_c) %>%
+  as.data.frame() %>%
+  cbind(efg_test$EfgPct)
+MAE(gbm_preds_efg$.pred, efg_test$EfgPct, na.rm = FALSE)
+
+gbm_fit_ftr <- gbm_model %>%
+  fit(ftr ~ ., data = ftr_train_c)
+gbm_preds_ftr <- predict(gbm_fit_ftr, new_data = ftr_test_c) %>%
+  as.data.frame() %>%
+  cbind(ftr_test$ftr)
+MAE(gbm_preds_ftr$.pred, ftr_test$ftr, na.rm = FALSE)
+
+gbm_fit_oreb <- gbm_model %>%
+  fit(off_reb_pct ~ ., data = oreb_train_c)
+gbm_preds_oreb <- predict(gbm_fit_oreb, new_data = oreb_test_c) %>%
+  as.data.frame() %>%
+  cbind(oreb_test$off_reb_pct)
+MAE(gbm_preds_oreb$.pred, oreb_test$off_reb_pct, na.rm = FALSE)
+
+gbm_fit_tor <- gbm_model %>%
+  fit(to_pct ~ ., data = tor_train_c)
+gbm_preds_tor <- predict(gbm_fit_tor, new_data = tor_test_c) %>%
+  as.data.frame() %>%
+  cbind(tor_test$to_pct)
+MAE(gbm_preds_tor$.pred, tor_test$to_pct, na.rm = FALSE)
+```
+
+data for predictions
+# adjust data for 2025 rosters, could not find data source for '25 rosters
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+stats_24 <- select_stats %>%
+  filter(pred_season == 2025)
+
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+
+player_pool <- stats_24 %>%
+  select(-c(pred_season)) %>%
+  rename(team = slugTeamBREF) %>%
+  filter(team != "TOT") %>%
+  distinct(namePlayer, .keep_all = TRUE) %>%
+  na.omit()
+
+```
+
+lineup function
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+lineup_function <- function(player1, player2, player3, player4, player5) {
+  lineup <- player_pool %>%
+  filter(namePlayer %in% c(player1, player2, player3, player4, player5))
+l_efg <- lineup %>%
+  summarize(
+    avg_3pt_rate = mean(avg_3pt_rate),
+    min_3pt_rate = min(avg_3pt_rate),
+    max_3pt_rate = max(avg_3pt_rate),
+    avg_pct_fg3 = mean(avg_pct_fg3),
+    min_pct_fg3 = min(avg_pct_fg3),
+    max_pct_fg3 = max(avg_pct_fg3),
+    avg_ft_pct = mean(avg_ft_pct),
+    min_ft_pct = min(avg_ft_pct),
+    max_ft_pct = max(avg_ft_pct),
+    avg_TS = mean(avg_TS),
+    min_TS = min(avg_TS),
+    max_TS = max(avg_TS),
+    avg_ast_pct = mean(avg_ast_pct),
+    min_ast_pct = min(avg_ast_pct),
+    max_ast_pct = max(avg_ast_pct)
+  )
+efg_pred <- (predict(svm_fit_efg, new_data = l_efg) + predict(rf_fit_efg, new_data = l_efg) +predict(gbm_fit_efg, new_data = l_efg))/3 %>%
+  as.data.frame()
+efg_pred <- efg_pred %>%
+  rename(`EFG%` = `.pred`)
+
+l_ftr <- lineup %>%
+  summarize(
+    avg_ftr = mean(avg_ft_rate),
+    min_ftr = min(avg_ft_rate),
+    max_ftr = max(avg_ft_rate),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage)
+  )
+ftr_pred <- (predict(svm_fit_ftr, new_data = l_ftr) + predict(rf_fit_ftr, new_data = l_ftr) + predict(gbm_fit_ftr, new_data = l_ftr))/3 %>%
+  as.data.frame()
+ftr_pred <- ftr_pred %>%
+  rename(`FT Rate` = .pred)
+
+l_oreb <- lineup %>%
+  summarize(
+    avg_oreb_pct = mean(avg_oreb_pct),
+    min_oreb_pct = min(avg_oreb_pct),
+    max_oreb_pct = max(avg_oreb_pct),
+    avg_dreb_pct = mean(avg_dreb_pct),
+    min_dreb_pct = min(avg_dreb_pct),
+    max_dreb_pct = max(avg_dreb_pct)
+  )
+oreb_pred <- (predict(svm_fit_oreb, new_data = l_oreb) + predict(rf_fit_oreb, new_data = l_oreb) + predict(gbm_fit_oreb, new_data = l_oreb))/3 %>%
+  as.data.frame()
+oreb_pred <- oreb_pred %>%
+  rename(`OREB%` = .pred)
+
+l_tor <- lineup %>%
+  summarize(
+    avg_ast_pct = mean(avg_ast_pct),
+    min_ast_pct = min(avg_ast_pct),
+    max_ast_pct = max(avg_ast_pct),
+    avg_tov_pct = mean(avg_tov_pct),
+    min_tov_pct = min(avg_tov_pct),
+    max_tov_pct = max(avg_tov_pct),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage)
+  )
+tor_pred <- (predict(svm_fit_tor, new_data = l_tor) + predict(rf_fit_tor, new_data = l_tor) + predict(gbm_fit_tor, new_data = l_tor))/3 %>%
+  as.data.frame()
+tor_pred <- tor_pred %>%
+  rename(`TO Rate` = .pred)
+
+combined_preds <- cbind(efg_pred, ftr_pred) %>%
+  cbind(oreb_pred) %>%
+  cbind(tor_pred) %>%
+  as.data.frame() %>%
+  mutate(Sample = "Projected Linuep")
+
+return(combined_preds)
+}
+lineup_results <- lineup_function("Jaysom Tatum", "Jaylen Brown", "Kristaps Porzingis", "Derrick White", "Jrue Holiday")
+
+chart_function <- function(pred_lineup) {
+  
+  league_df <- data.frame(
+  `EFG%` = mean(lineup_data$EfgPct, na.rm = TRUE),
+  `FT Rate` = mean(lineup_data$ftr, na.rm = TRUE),
+  `OREB%` = mean(lineup_data$off_reb_pct, na.rm = TRUE),
+  `TO Rate` = mean(lineup_data$to_pct, na.rm = TRUE),
+  Sample = "League Avg"
+) %>%
+  rename(`EFG%` = EFG.,
+         `FT Rate` = FT.Rate,
+         `OREB%` = OREB.,
+         `TO Rate` = TO.Rate)
+
+  chart_df <- rbind(league_df, pred_lineup)
+  long_df <- melt(chart_df, id.vars = "Sample", 
+                measure.vars = c("EFG%", "OREB%", "FT Rate", "TO Rate"), 
+                variable.name = "Metric", 
+                value.name = "Value")
+  
+  plot_ly(long_df, x = ~Metric, y = ~Value, color = ~Sample, colors = c("blue", "red"), 
+        type = 'bar', barmode = 'group') %>%
+  layout(title = "Comparison of League Avg vs Projected Lineup",
+         xaxis = list(title = "Metrics"),
+         yaxis = list(title = "Value"),
+         legend = list(title = list(text = "Sample")))
+}
+chart_function(lineup_results)
+
+# distance for similar lineups 
+dis_df <- lineup_data %>%
+  filter(pred_season > 2020)
+league_dis <- dis_df %>%
+  select(EfgPct,
+         to_pct,
+         off_reb_pct,
+         ftr) %>%
+  rename(`EFG%` = EfgPct,
+         `FT Rate` = ftr,
+         `OREB%` = off_reb_pct,
+         `TO Rate` = to_pct)
+euclidean_distances <- apply(league_dis, 1, function(row) {
+  sqrt(sum((row - lineup_results[ ,-5])^2))
+})
+euc_res <- cbind(euclidean_distances, dis_df) %>%
+  arrange(euclidean_distances) %>%
+  head(5) %>%
+  mutate(Year = pred_season - 1) %>%
+  select(-pred_season)
+
+```
+combined function - model, chart, similar lineups
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+# add team averages using a reference to a player
+combined_function <- function(player1, player2, player3, player4, player5) {
+  lineup <- player_pool %>%
+  filter(namePlayer %in% c(player1, player2, player3, player4, player5))
+l_efg <- lineup %>%
+  summarize(
+    avg_3pt_rate = mean(avg_3pt_rate),
+    min_3pt_rate = min(avg_3pt_rate),
+    max_3pt_rate = max(avg_3pt_rate),
+    avg_pct_fg3 = mean(avg_pct_fg3),
+    min_pct_fg3 = min(avg_pct_fg3),
+    max_pct_fg3 = max(avg_pct_fg3),
+    avg_ft_pct = mean(avg_ft_pct),
+    min_ft_pct = min(avg_ft_pct),
+    max_ft_pct = max(avg_ft_pct),
+    avg_TS = mean(avg_TS),
+    min_TS = min(avg_TS),
+    max_TS = max(avg_TS),
+    avg_pps = mean(avg_pps),
+    min_pps = min(avg_pps),
+    max_pps = max(avg_pps)
+  )
+efg_pred <- (predict(svm_fit_efg, new_data = l_efg) + predict(rf_fit_efg, new_data = l_efg) +predict(gbm_fit_efg, new_data = l_efg))/3 %>%
+  as.data.frame()
+efg_pred <- efg_pred %>%
+  rename(`EFG%` = `.pred`)
+
+l_ftr <- lineup %>%
+  summarize(
+    avg_ftr = mean(avg_ft_rate),
+    min_ftr = min(avg_ft_rate),
+    max_ftr = max(avg_ft_rate),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage),
+    avg_ft_pct = mean(avg_ft_pct),
+    min_ft_pct = min(avg_ft_pct),
+    max_ft_pct = max(avg_ft_pct)
+  )
+ftr_pred <- (predict(svm_fit_ftr, new_data = l_ftr) + predict(rf_fit_ftr, new_data = l_ftr) + predict(gbm_fit_ftr, new_data = l_ftr))/3 %>%
+  as.data.frame()
+ftr_pred <- ftr_pred %>%
+  rename(`FT Rate` = .pred)
+
+l_oreb <- lineup %>%
+  summarize(
+    avg_oreb_pct = mean(avg_oreb_pct),
+    min_oreb_pct = min(avg_oreb_pct),
+    max_oreb_pct = max(avg_oreb_pct),
+    avg_dreb_pct = mean(avg_dreb_pct),
+    min_dreb_pct = min(avg_dreb_pct),
+    max_dreb_pct = max(avg_dreb_pct)
+  )
+oreb_pred <- (predict(svm_fit_oreb, new_data = l_oreb) + predict(rf_fit_oreb, new_data = l_oreb) + predict(gbm_fit_oreb, new_data = l_oreb))/3 %>%
+  as.data.frame()
+oreb_pred <- oreb_pred %>%
+  rename(`OREB%` = .pred)
+
+l_tor <- lineup %>%
+  summarize(
+    avg_ast_pct = mean(avg_ast_pct),
+    min_ast_pct = min(avg_ast_pct),
+    max_ast_pct = max(avg_ast_pct),
+    avg_tov_pct = mean(avg_tov_pct),
+    min_tov_pct = min(avg_tov_pct),
+    max_tov_pct = max(avg_tov_pct),
+    avg_usage = mean(avg_usage),
+    min_usage = min(avg_usage),
+    max_usage = max(avg_usage),
+    avg_ast_to = mean(avg_ast_to),
+    min_ast_to = min(avg_ast_to),
+    max_ast_to = max(avg_ast_to)
+  )
+tor_pred <- (predict(svm_fit_tor, new_data = l_tor) + predict(rf_fit_tor, new_data = l_tor) + predict(gbm_fit_tor, new_data = l_tor))/3 %>%
+  as.data.frame()
+tor_pred <- tor_pred %>%
+  rename(`TO Rate` = .pred)
+
+combined_preds <- cbind(efg_pred, ftr_pred) %>%
+  cbind(oreb_pred) %>%
+  cbind(tor_pred) %>%
+  as.data.frame() %>%
+  mutate(Sample = "Projected Linuep")
+
+ league_avgs <- lineup_data %>%
+   filter(pred_season == 2024)
+   
+ league_df <- data.frame(
+  `EFG%` = mean(league_avgs$EfgPct, na.rm = TRUE),
+  `FT Rate` = mean(league_avgs$ftr, na.rm = TRUE),
+  `OREB%` = mean(league_avgs$off_reb_pct, na.rm = TRUE),
+  `TO Rate` = mean(league_avgs$to_pct, na.rm = TRUE),
+  Sample = "League Avg - 2024"
+) %>%
+  rename(`EFG%` = EFG.,
+         `FT Rate` = FT.Rate,
+         `OREB%` = OREB.,
+         `TO Rate` = TO.Rate)
+  
+  team_avg <- league_avgs %>%
+    filter(TeamAbbreviation == lineup$team[1]) %>%
+    summarize(
+      `EFG%` = mean(EfgPct, na.rm = TRUE),
+      `FT Rate` = mean(ftr, na.rm = TRUE),
+      `OREB%` = mean(off_reb_pct, na.rm = TRUE),
+      `TO Rate` = mean(to_pct, na.rm = TRUE),
+    ) %>%
+    mutate(Sample = "Team Avg - 2024")
+  chart_df <- rbind(league_df, combined_preds, team_avg)
+  long_df <- melt(chart_df, id.vars = "Sample", 
+                measure.vars = c("EFG%", "OREB%", "FT Rate", "TO Rate"), 
+                variable.name = "Metric", 
+                value.name = "Value")
+  
+  chart <- plot_ly(long_df, x = ~Metric, y = ~Value, color = ~Sample, colors = c("blue", "red", "grey"), 
+        type = 'bar', barmode = 'group') %>%
+  layout(title = "Comparison of League Avg vs Projected Lineup",
+         xaxis = list(title = "Metrics"),
+         yaxis = list(title = "Value"),
+         legend = list(title = list(text = "Sample"))) 
+  
+  dis_df <- lineup_data %>%
+  filter(pred_season > 2020)
+league_dis <- dis_df %>%
+  select(EfgPct,
+         to_pct,
+         off_reb_pct,
+         ftr) %>%
+  rename(`EFG%` = EfgPct,
+         `FT Rate` = ftr,
+         `OREB%` = off_reb_pct,
+         `TO Rate` = to_pct)
+euclidean_distances <- apply(league_dis, 1, function(row) {
+  sqrt(sum((row - combined_preds[ ,-5])^2))
+})
+euc_res <- cbind(euclidean_distances, dis_df) %>%
+  arrange(euclidean_distances) %>%
+  head(5) %>%
+  mutate(Year = pred_season - 1) %>%
+  rename(Team = TeamAbbreviation,
+         "Euclidean Distance" = euclidean_distances) %>%
+  select(`Euclidean Distance`,
+         Team,
+         Year, 
+         `Player 1`,
+         `Player 2`,
+         `Player 3`,
+         `Player 4`,
+         `Player 5`) 
+  
+  return(list(predictions = combined_preds[ , -5], chart = chart, similar_lineups = euc_res))
+}
+
+combined_function("Jaysom Tatum", "Jaylen Brown", "Kristaps Porzingis", "Derrick White", "Jrue Holiday")
+```
+
+shiny app - no optimization
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+ui <- fluidPage(
+  titlePanel("Basketball Lineup Projector"),
+  
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("team", "Select Team:",
+                  choices = unique(player_pool$team),
+                  selected = NULL),
+      uiOutput("player_select")
+    ),
+    
+    mainPanel(
+      tableOutput("lineup_preds"),  # Display predictions above the chart
+      plotlyOutput("lineup_chart"),
+      tableOutput("similar_lineups")
+    )
+  )
+)
+
+server <- function(input, output, session) {
+  
+  # Reactive expression to filter players based on selected team
+  filtered_players <- reactive({
+    req(input$team)
+    player_pool %>%
+      filter(team == input$team) %>%
+      pull(namePlayer)
+  })
+  
+  # Dynamic UI for player selection based on selected team
+  output$player_select <- renderUI({
+    req(filtered_players())
+    checkboxGroupInput("players", "Select 5 Players:", 
+                       choices = filtered_players(), 
+                       selected = NULL,
+                       inline = FALSE)
+  })
+  
+  # Reactive expression to compute results based on selected players
+  results <- reactive({
+    req(input$players)
+    if (length(input$players) != 5) {
+      return(NULL)
+    }
+    combined_function(input$players[1], input$players[2], input$players[3], input$players[4], input$players[5])
+  })
+  
+  # Render the predictions table
+  output$lineup_preds <- renderTable({
+    req(results())
+    results()$predictions
+  })
+  
+  # Render the plotly chart
+  output$lineup_chart <- renderPlotly({
+    req(results())
+    results()$chart
+  })
+  
+  # Render the similar lineups table
+  output$similar_lineups <- renderTable({
+    req(results())
+    results()$similar_lineups
+  })
+}
+
+# Run the Shiny app
+shinyApp(ui = ui, server = server)
+
+```
+
+shiny app with optimization and exclusion box
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+ui <- fluidPage(
+  titlePanel("Basketball Lineup Projector"),
+  
+  # Add notes below the title panel using tags for HTML elements
+  div(
+    p("This app projects basketball lineups based on selected players and team data."),
+    
+    # Operation notes section
+    p("Operation notes:"),
+    tags$ul(
+      tags$li("You can select 5 players to project their performance. Tha bar chart compares the lineup porjection with league and team averages."),
+      tags$li("If fewer than 5 players are selected, the app will optimize the remaining players. The less `selected` players there are the longer the model takes to run"),
+      tags$li("The optimization is based on one of the Four Factors: Effective Field Goal Percentage (EFG%), Free Throw Rate (FT Rate), Offensive Rebound Percentage (OREB%), or Turnover Rate (TO Rate).")
+    ),
+    
+    # Model notes section
+    p("Model notes:"),
+    tags$ul(
+      tags$li("The model is trained on lineup data from the last 10 seasons, limited to lineups that played at least 150 possessions."),
+      tags$li("This is an ensemble model that combines a support vector machine model, gradient boosted model, and random forest model using a simple aggregation. This method leverages the principle of the wisdom of the crowd."),
+      tags$li("Averages for the bar chart are from the last season.")
+    ),
+    
+    style = "font-size:14px; color: #333;"
+  ),
+  
+  sidebarLayout(
+    sidebarPanel(
+      selectInput("team", "Select Team:",
+                  choices = unique(player_pool$team),
+                  selected = NULL),
+      uiOutput("player_select"),            # Player selection
+      uiOutput("exclude_player_select"),    # Exclude players box (now placed after player selection)
+      selectInput("optimize_stat", "Optimize For Stat:",
+                  choices = c("EFG%", "FT Rate", "OREB%", "TO Rate"),
+                  selected = "EFG%"),
+      actionButton("optimize_btn", "Run Model")  # Optimization button
+    ),
+    
+    mainPanel(
+      tableOutput("selected_players"),    # Display initially selected players
+      tableOutput("optimized_players"),   # Display optimized players
+      tableOutput("lineup_preds"),        # Display predictions
+      plotlyOutput("lineup_chart"),       # Display chart
+      uiOutput("similar_lineups_title"),  # Conditional title for similar lineups
+      tableOutput("similar_lineups")      # Display similar lineups
+    )
+  )
+)
+server <- function(input, output, session) {
+  
+  # Reactive expression to filter players based on selected team
+  filtered_players <- reactive({
+    req(input$team)
+    player_pool %>%
+      filter(team == input$team) %>%
+      pull(namePlayer)
+  })
+  
+  # Dynamic UI for player selection based on selected team
+  output$player_select <- renderUI({
+    req(filtered_players())
+    checkboxGroupInput("players", "Select Players:", 
+                       choices = filtered_players(), 
+                       selected = NULL,
+                       inline = FALSE)
+  })
+  
+  # Dynamic UI for exclude players based on selected team
+  output$exclude_player_select <- renderUI({
+    req(filtered_players())
+    selectizeInput("exclude_players", "Exclude Players:", 
+                   choices = filtered_players(), 
+                   selected = NULL,
+                   multiple = TRUE)
+  })
+  
+  # Reactive expression to compute results based on selected players
+  results <- eventReactive(input$optimize_btn, {
+    req(input$players)
+    
+    # If exactly 5 players are selected, run the original function
+    if (length(input$players) == 5) {
+      combined_function(input$players[1], input$players[2], input$players[3], input$players[4], input$players[5])
+      
+    # If fewer than 5 players are selected, optimize to fill the lineup
+    } else if (length(input$players) > 0) {
+      num_missing <- 5 - length(input$players)
+      selected_players <- input$players
+      
+      # Function to optimize for a given stat
+      optimize_lineup <- function(stat) {
+        all_players <- filtered_players()
+        
+        # Exclude the selected players and players to exclude from the available pool
+        available_players <- setdiff(all_players, c(selected_players, input$exclude_players))
+        
+        player_combinations <- combn(available_players, num_missing, simplify = FALSE)
+        
+        best_score <- -Inf
+        best_combination <- NULL
+        
+        for (combo in player_combinations) {
+          lineup <- c(selected_players, combo)
+          preds <- combined_function(lineup[1], lineup[2], lineup[3], lineup[4], lineup[5])
+          score <- preds$predictions[[stat]]
+          
+          if (score > best_score) {
+            best_score <- score
+            best_combination <- combo
+          }
+        }
+        
+        return(best_combination)
+      }
+      
+      # Optimize for the selected stat
+      best_combination <- optimize_lineup(input$optimize_stat)
+      final_players <- c(selected_players, best_combination)
+      
+      combined_results <- combined_function(final_players[1], final_players[2], final_players[3], final_players[4], final_players[5])
+      
+      return(list(
+        selected = selected_players,
+        optimized = best_combination,
+        predictions = combined_results$predictions,
+        chart = combined_results$chart,
+        similar_lineups = combined_results$similar_lineups
+      ))
+      
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # Render the initially selected players table
+  output$selected_players <- renderTable({
+    req(input$players)
+    if (length(input$players) > 0) {
+      data.frame("Selected Players" = input$players)
+    } else {
+      data.frame("Selected Players" = "None")
+    }
+  })
+  
+  # Render the optimized players table
+  output$optimized_players <- renderTable({
+    req(results())
+    if (!is.null(results()$optimized)) {
+      data.frame("Optimized Players" = results()$optimized)
+    } else {
+      data.frame("Optimized Players" = "None")
+    }
+  })
+  
+  # Render the predictions table
+  output$lineup_preds <- renderTable({
+    req(results())
+    results()$predictions
+  })
+  
+  # Render the plotly chart
+  output$lineup_chart <- renderPlotly({
+    req(results())
+    results()$chart
+  })
+  
+  # Conditionally render the similar lineups title
+  output$similar_lineups_title <- renderUI({
+    req(results())
+    if (!is.null(results()$similar_lineups) && length(results()$similar_lineups) > 0) {
+      h3("5 Similar Lineups from the Last 4 Seasons")
+    } else {
+      NULL
+    }
+  })
+  
+  # Render the similar lineups table
+  output$similar_lineups <- renderTable({
+  req(results())
+  similar_lineups <- results()$similar_lineups
+  
+  # Format Year column
+  if (!is.null(similar_lineups)) {
+    similar_lineups$Year <- format(similar_lineups$Year, nsmall = 0)  # Ensure no decimal places
+  }
+  
+  similar_lineups
+})
+}
+
+# Run the Shiny app
+shinyApp(ui = ui, server = server)
+```
+
+publishing app
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+rsconnect::setAccountInfo(name='rbasketball',
+			  token='C6402382F39CDAC8526C2D9323BABEB4',
+			  secret='TwrPD0sQS/6Ni+CXrJuQab4LXPTf1VywskgfJ/wa')
+
+deployApp('/Users/dylan/Desktop')
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+getwd()
+
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+
+```
+
+```{r, error=FALSE, warning=FALSE, message=FALSE}
+
+```
+
